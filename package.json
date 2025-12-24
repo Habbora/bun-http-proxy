@@ -2,7 +2,12 @@
   "name": "bun-http-proxy",
   "version": "0.1.0",
   "module": "src/index.ts",
-  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
   "exports": {
     ".": "./src/index.ts"
   },
@@ -13,10 +18,5 @@
     "dev": "bun run --watch src/server.ts",
     "start": "bun run src/server.ts"
   },
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  }
+  "type": "module"
 }
