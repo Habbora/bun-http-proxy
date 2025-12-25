@@ -3,6 +3,7 @@ import { formatPathname } from "./utils/pathname";
 import axios from "axios";
 
 export type BunReverseProxyOptions = {
+    hostname?: string;
     port: number;
     routes?: Record<string, string>;
     debug?: boolean;
@@ -113,6 +114,7 @@ export class BunReverseProxy {
 
     private createServer = () => {
         return Bun.serve({
+            hostname: this.options.hostname || "localhost",
             port: this.options.port,
             fetch: async (req, server) => {
                 return await this.fetchHandle(req, server);
