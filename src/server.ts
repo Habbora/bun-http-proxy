@@ -6,7 +6,7 @@ export type BunReverseProxyOptions = {
     port: number;
     routes?: Record<string, string>;
     debug?: boolean;
-    rewriteContent?: boolean; // Toggle for HTML/CSS rewriting
+    rewriteContent?: boolean;
 };
 
 const hopByHopHeaderNames = new Set([
@@ -41,21 +41,12 @@ const deleteConnectionListedHeaders = (headers: Headers) => {
 const headersToLogObject = (headers: Headers | Record<string, any>) => {
     const out: Record<string, string> = {};
     const entries = headers instanceof Headers ? headers.entries() : Object.entries(headers);
-    
+
     for (const [name, value] of entries) {
         const key = name.toLowerCase();
         out[name] = redactedHeaderNames.has(key) ? "[redacted]" : String(value);
     }
     return out;
-};
-
-const parseHost = (host: string | null) => {
-    if (!host) return { host: "", hostname: "", port: "" };
-    const trimmed = host.trim();
-    if (!trimmed) return { host: "", hostname: "", port: "" };
-    const hostname = trimmed.split(":")[0] ?? trimmed;
-    const port = trimmed.includes(":") ? (trimmed.split(":")[1] ?? "") : "";
-    return { host: trimmed, hostname, port };
 };
 
 const stripBasePath = (pathname: string, basePath: string) => {
@@ -123,91 +114,66 @@ export class BunReverseProxy {
     private createServer = () => {
         return Bun.serve({
             port: this.options.port,
-
             fetch: async (req, server) => {
-                const requestId = ++this.requestSeq;
-                const startedAt = performance.now();
-
-                if (req.method.toUpperCase() === "CONNECT") {
-                    return new Response("CONNECT not supported", { status: 501 });
-                }
-
-                const { hostname } = parseHost(req.headers.get("host"));
-                const resolvedHostname = hostname || new URL(req.url).hostname;
-                const clientIp = server.requestIP(req)?.address;
-
-                if (!resolvedHostname)
-                    return new Response("Bad Request", { status: 400 });
-
-                // Find route
-                const target = this.routes[resolvedHostname];
-                if (!target) return new Response("Not Found", { status: 404 });
-
-                if (this.options.debug) {
-                    console.log("[proxy:req]", {
-                        id: requestId,
-                        method: req.method,
-                        url: req.url,
-                        host: req.headers.get("host"),
-                        matchedHost: resolvedHostname,
-                        target,
-                        clientIp,
-                        headers: headersToLogObject(req.headers),
-                    });
-                }
-
-                try {
-                    return await this.proxy(req, target, requestId, startedAt, resolvedHostname, clientIp);
-                } catch (error) {
-                    console.error("[proxy:error]", error);
-                    return new Response("Bad Gateway", { status: 502 });
-                }
+                return await this.fetchHandle(req, server);
             },
         });
     };
 
-    private proxy = async (
-        req: Request,
-        target: string,
-        requestId: number,
-        startedAt: number,
-        matchedHost: string,
-        clientIp?: string
-    ) => {
-        // Build Upstream URL
-        const incomingUrl = new URL(req.url);
-        const upstreamUrl = new URL(target);
-        const basePath = upstreamUrl.pathname === "/" ? "" : upstreamUrl.pathname.replace(/\/$/, "");
+    private fetchHandle = async (req: Request, server: Bun.Server<any>): Promise<Response> => {
+        const requestId = ++this.requestSeq;
+        const startedAt = performance.now();
 
+        if (req.method.toLowerCase() === "connect") {
+            return new Response("connect not supported", { status: 501 });
+        }
+
+        const requestURL = new URL(req.url);
+        const requestHostname = requestURL.hostname || req.headers.get("host");
+        if (!requestHostname) return new Response("Bad Request", { status: 400 });
+        const clientIp = server.requestIP(req)?.address;
+
+        // Find route by hostname
+        const target = this.routes[requestHostname];
+        if (!target) return new Response("Not Found", { status: 404 });
+
+        if (this.options.debug) {
+            console.log("[client:req]", {
+                id: requestId,
+                request: req.clone()
+            });
+        }
+
+        const upstreamUrl = new URL(target);
         // Path rewriting: /foo -> /basePath/foo
-        upstreamUrl.pathname = formatPathname(basePath + incomingUrl.pathname);
-        upstreamUrl.search = incomingUrl.search;
-        upstreamUrl.hash = incomingUrl.hash;
+        upstreamUrl.pathname = formatPathname(upstreamUrl.pathname + requestURL.pathname);
+        upstreamUrl.search = requestURL.search;
+        upstreamUrl.hash = requestURL.hash;
 
         // Build Upstream Headers
         const upstreamHeaders: Record<string, string> = {};
         req.headers.forEach((value, key) => {
-             if (!hopByHopHeaderNames.has(key.toLowerCase())) {
-                 upstreamHeaders[key] = value;
-             }
+            if (!hopByHopHeaderNames.has(key.toLowerCase())) {
+                upstreamHeaders[key] = value;
+            }
         });
-        
+
         upstreamHeaders["host"] = upstreamUrl.host;
-        
+
         // Disable compression to allow rewriting
         delete upstreamHeaders["accept-encoding"];
-        
+
         // Remove headers that might cause 304 Not Modified
         delete upstreamHeaders["if-none-match"];
         delete upstreamHeaders["if-modified-since"];
 
         // Forwarding headers
-        const clientHost = req.headers.get("host") || incomingUrl.host;
-        const proto = incomingUrl.protocol.replace(":", "");
+        const clientHost = req.headers.get("host") || requestURL.host;
+        const proto = requestURL.protocol.replace(":", "");
         if (clientHost) {
             upstreamHeaders["x-forwarded-host"] = clientHost;
             upstreamHeaders["x-forwarded-proto"] = proto;
-            upstreamHeaders["x-forwarded-server"] = matchedHost;
+            upstreamHeaders["x-forwarded-server"] = requestHostname;
         }
         if (clientIp) {
             const prev = upstreamHeaders["x-forwarded-for"];
@@ -219,22 +185,21 @@ export class BunReverseProxy {
         if (origin) {
             try {
                 const originUrl = new URL(origin);
-                if (originUrl.hostname === matchedHost) upstreamHeaders["origin"] = upstreamUrl.origin;
+                if (originUrl.hostname === requestHostname) upstreamHeaders["origin"] = upstreamUrl.origin;
             } catch { }
         }
 
         if (this.options.debug) {
-            console.log("[proxy:upstream:req]", {
+            console.log("[proxy:req]", {
                 id: requestId,
                 url: upstreamUrl.toString(),
                 headers: headersToLogObject(upstreamHeaders),
             });
         }
 
-        // Use Axios instead of Fetch for better stability with legacy servers/chunked encoding
         let upstreamRes;
         let responseBody: ArrayBuffer;
-        
+
         try {
             // Read body from request if present
             let body = null;
@@ -271,14 +236,14 @@ export class BunReverseProxy {
 
         // Fix Location Header
         const location = downstreamHeaders.get("location");
-        const clientOrigin = `${incomingUrl.protocol}//${clientHost}`;
+        const clientOrigin = `${requestURL.protocol}//${clientHost}`;
         if (location) {
             try {
                 const resolvedLoc = new URL(location, upstreamUrl);
                 // Only rewrite if it points to the upstream
                 if (resolvedLoc.origin === upstreamUrl.origin) {
                     const clientLoc = new URL(clientOrigin);
-                    clientLoc.pathname = stripBasePath(resolvedLoc.pathname, basePath);
+                    clientLoc.pathname = stripBasePath(resolvedLoc.pathname, requestURL.pathname);
                     clientLoc.search = resolvedLoc.search;
                     clientLoc.hash = resolvedLoc.hash;
                     downstreamHeaders.set("location", clientLoc.toString());
@@ -293,7 +258,7 @@ export class BunReverseProxy {
             for (const cookie of setCookies) {
                 downstreamHeaders.append(
                     "set-cookie",
-                    rewriteSetCookieForClient(cookie, matchedHost, basePath)
+                    rewriteSetCookieForClient(cookie, requestHostname, requestURL.pathname)
                 );
             }
         }
@@ -307,34 +272,31 @@ export class BunReverseProxy {
         // Content Rewriting
         if (this.options.rewriteContent !== false) {
             if (this.options.rewriteContent) {
-                 const rewriter = new ContentRewriter(upstreamUrl.origin, clientOrigin, basePath);
-                 downstreamRes = rewriter.transform(downstreamRes);
+                const rewriter = new ContentRewriter(upstreamUrl.origin, clientOrigin, requestURL.pathname);
+                downstreamRes = rewriter.transform(downstreamRes);
             }
         }
 
         // Debug Headers
         if (this.options.debug) {
-            const durationMs = performance.now() - startedAt;
             downstreamRes.headers.set("x-bun-proxy-id", String(requestId));
             downstreamRes.headers.set("x-bun-proxy-upstream", upstreamUrl.origin);
-            downstreamRes.headers.set("x-bun-proxy-time", durationMs.toFixed(1));
 
             console.log("[proxy:upstream:res]", {
                 id: requestId,
                 status: upstreamRes.status,
                 headers: headersToLogObject(downstreamHeaders),
-                duration: durationMs.toFixed(1) + "ms"
             });
         }
 
         return downstreamRes;
-    };
+    }
 }
 
 if (import.meta.main) {
     const port = process.env.PORT ? Number(process.env.PORT) : 3000;
     const debug = process.env.DEBUG !== "false";
-    
+
     // Example usage
     const proxy = new BunReverseProxy({
         port,
